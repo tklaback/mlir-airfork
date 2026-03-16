@@ -144,6 +144,7 @@ class NKIEmitter:
         self._counter = 0
         self._first_input = "arg0"        # for arg.shape[dim] in loop bounds
         self._loop_depth = 0              # incremented per non-trivial scf.for
+        self._tile: tuple[int, int] | None = None
 
     # -----------------------------------------------------------------------
     # Visitor dispatch
@@ -244,6 +245,38 @@ class NKIEmitter:
                 f"output = nl.ndarray({src}.shape, dtype={src}.dtype,"
                 f" buffer=nl.shared_hbm)"
             )
+
+        # If a tile spec was provided (set by caller), emit a tiled SPMD-style kernel.
+        if self._tile is not None:
+            tx, ty = self._tile
+
+            self._emit(f"c_output = nl.ndarray({self._first_input}.shape, dtype={self._first_input}.dtype, buffer=nl.shared_hbm)")
+            self._blank()
+
+            self._emit(f"offset_i_x = nl.program_id(0) * {tx}")
+            self._emit(f"offset_i_y = nl.program_id(1) * {ty}")
+            self._blank()
+
+            self._emit(f"ix = offset_i_x + nl.arange({tx})[:, None]")
+            self._emit(f"iy = offset_i_y + nl.arange({ty})[None, :]")
+            self._blank()
+
+            a_name = input_names[0] if len(input_names) > 0 else self._first_input
+            b_name = input_names[1] if len(input_names) > 1 else (self._first_input)
+            self._emit(f"a_tile = nl.load({a_name}[ix, iy])")
+            self._emit(f"b_tile = nl.load({b_name}[ix, iy])")
+            self._blank()
+
+            self._emit("c_tile = a_tile + b_tile")
+            self._blank()
+
+            self._emit("nl.store(c_output[ix, iy], value=c_tile)")
+            self._blank()
+
+            self._emit("return c_output")
+            self._pop()
+            self._blank()
+            return
 
         for inner in entry.operations:
             self.visit(inner)
@@ -380,6 +413,10 @@ def main():
         help="Skip air-opt lowering: input is already in func/scf/memref/arith "
              "(use this for the #Start section of test.lit)",
     )
+    parser.add_argument(
+        "--tile", dest="tile", default=None,
+        help="Optional tile sizes as WIDTHxHEIGHT (e.g. 128x512) to emit a tiled kernel",
+    )
     args = parser.parse_args()
 
     with open(args.input) as f:
@@ -392,10 +429,24 @@ def main():
         air_opt = _find_air_opt(args.air_opt)
         src = lower_mlir(src, air_opt)
 
+    # Parse tile option into a tuple if provided
+    tile: tuple[int, int] | None = None
+    if args.tile:
+        try:
+            parts = args.tile.split("x")
+            tile = (int(parts[0]), int(parts[1]))
+        except Exception:
+            print("Invalid --tile format. Use WIDTHxHEIGHT, e.g. 128x512", file=sys.stderr)
+            sys.exit(1)
+
     with ir.Context() as ctx:
         ctx.allow_unregistered_dialects = True
         module = ir.Module.parse(src)
-        nki_src = NKIEmitter().emit_module(module)
+        emitter = NKIEmitter()
+        # Set tile on emitter if provided (keeps backward compatibility)
+        if tile is not None:
+            emitter._tile = tile
+        nki_src = emitter.emit_module(module)
 
     if args.output:
         with open(args.output, "w") as f:
