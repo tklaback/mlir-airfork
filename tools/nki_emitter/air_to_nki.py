@@ -246,34 +246,10 @@ class NKIEmitter:
                 f" buffer=nl.shared_hbm)"
             )
 
-        # If a tile spec was provided (set by caller), emit a tiled SPMD-style kernel.
-        if self._tile is not None:
-            tx, ty = self._tile
-
-            self._emit(f"c_output = nl.ndarray({self._first_input}.shape, dtype={self._first_input}.dtype, buffer=nl.shared_hbm)")
-            self._blank()
-
-            self._emit(f"offset_i_x = nl.program_id(0) * {tx}")
-            self._emit(f"offset_i_y = nl.program_id(1) * {ty}")
-            self._blank()
-
-            self._emit(f"ix = offset_i_x + nl.arange({tx})[:, None]")
-            self._emit(f"iy = offset_i_y + nl.arange({ty})[None, :]")
-            self._blank()
-
-            a_name = input_names[0] if len(input_names) > 0 else self._first_input
-            b_name = input_names[1] if len(input_names) > 1 else (self._first_input)
-            self._emit(f"a_tile = nl.load({a_name}[ix, iy])")
-            self._emit(f"b_tile = nl.load({b_name}[ix, iy])")
-            self._blank()
-
-            self._emit("c_tile = a_tile + b_tile")
-            self._blank()
-
-            self._emit("nl.store(c_output[ix, iy], value=c_tile)")
-            self._blank()
-
-            self._emit("return c_output")
+        # Decide whether to emit a tiled implementation.
+        if self._tile is not None or self._is_simple_add_pattern(entry):
+            tile = self._tile if self._tile is not None else (16, 16)
+            self._emit_tiled_add(input_names, tile)
             self._pop()
             self._blank()
             return
@@ -284,6 +260,85 @@ class NKIEmitter:
         self._blank()
 
     def visit_func_return(self, op: ir.Operation):
+        self._emit("return output")
+
+    def _is_simple_add_pattern(self, entry: ir.Block) -> bool:
+        """Detect a simple 2D require elementwise add pattern in MLIR.
+
+        Pattern:
+          - optional arith.constant ops
+          - outer scf.for
+          - inner scf.for
+          - inner body: memref.load, memref.load, arith.addf, memref.store, scf.yield
+        """
+        ops = [op for op in entry.operations if op.operation.name not in ("arith.constant", "func.return")]
+        if len(ops) != 1 or ops[0].operation.name != "scf.for":
+            return False
+
+        outer_for = ops[0]
+        outer_body = outer_for.regions[0].blocks[0]
+        inner_ops = [op for op in outer_body.operations if op.operation.name != "scf.yield"]
+        if len(inner_ops) != 1 or inner_ops[0].operation.name != "scf.for":
+            return False
+
+        inner_for = inner_ops[0]
+        inner_block = inner_for.regions[0].blocks[0]
+        body_ops = list(inner_block.operations)
+
+        if len(body_ops) != 5:
+            return False
+
+        if [op.operation.name for op in body_ops] != ["memref.load", "memref.load", "arith.addf", "memref.store", "scf.yield"]:
+            return False
+
+        load0, load1, addf, store, _ = body_ops
+        if addf.operands[0] != load0.results[0] or addf.operands[1] != load1.results[0]:
+            return False
+
+        if store.operands[0] != addf.results[0]:
+            return False
+
+        outer_iv = outer_body.arguments[0]
+        inner_iv = inner_block.arguments[0]
+
+        load0_idx = list(load0.operands[1:])
+        load1_idx = list(load1.operands[1:])
+        store_idx = list(store.operands[2:])
+
+        if load0_idx != [outer_iv, inner_iv]:
+            return False
+        if load1_idx != [outer_iv, inner_iv]:
+            return False
+        if store_idx != [outer_iv, inner_iv]:
+            return False
+
+        return True
+
+    def _emit_tiled_add(self, input_names: list[str], tile: tuple[int, int]) -> None:
+        tx, ty = tile
+        self._emit("# Pattern-matched 2D tensor add emitted as tiled NKI kernel")
+        self._blank()
+
+        self._emit(f"offset_i_x = nl.program_id(0) * {tx}")
+        self._emit(f"offset_i_y = nl.program_id(1) * {ty}")
+        self._blank()
+
+        self._emit(f"ix = offset_i_x + nl.arange({tx})[:, None]")
+        self._emit(f"iy = offset_i_y + nl.arange({ty})[None, :]")
+        self._blank()
+
+        a_name = input_names[0] if len(input_names) > 0 else self._first_input
+        b_name = input_names[1] if len(input_names) > 1 else self._first_input
+        self._emit(f"a_tile = nl.load({a_name}[ix, iy])")
+        self._emit(f"b_tile = nl.load({b_name}[ix, iy])")
+        self._blank()
+
+        self._emit("c_tile = nisa.tensor_tensor(a_tile, b_tile, op=np.add)")
+        self._blank()
+
+        self._emit("nl.store(output[ix, iy], value=c_tile)")
+        self._blank()
+
         self._emit("return output")
 
     # --- arith constants are inlined as literals; no Python statement emitted ---

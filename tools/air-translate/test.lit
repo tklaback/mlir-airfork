@@ -9,12 +9,15 @@
 # CHECK: @nki.jit
 # CHECK: def simple_add(arg0, arg1):
 # CHECK:   output = nl.ndarray(arg0.shape, dtype=arg0.dtype, buffer=nl.shared_hbm)
-# CHECK:   for i in nl.affine_range(arg0.shape[0]):
-# CHECK:     for j in nl.affine_range(arg0.shape[1]):
-# CHECK:       val[[A:[0-9]+]] = nl.load(arg0[i, j])
-# CHECK:       val[[B:[0-9]+]] = nl.load(arg1[i, j])
-# CHECK:       res[[C:[0-9]+]] = nisa.tensor_tensor(val[[A]], val[[B]], op=np.add)
-# CHECK:       nl.store(output[i, j], value=res[[C]])
+# CHECK:   # Pattern-matched 2D tensor add emitted as tiled NKI kernel
+# CHECK:   offset_i_x = nl.program_id(0) * 16
+# CHECK:   offset_i_y = nl.program_id(1) * 16
+# CHECK:   ix = offset_i_x + nl.arange(16)[:, None]
+# CHECK:   iy = offset_i_y + nl.arange(16)[None, :]
+# CHECK:   a_tile = nl.load(arg0[ix, iy])
+# CHECK:   b_tile = nl.load(arg1[ix, iy])
+# CHECK:   c_tile = nisa.tensor_tensor(a_tile, b_tile, op=np.add)
+# CHECK:   nl.store(output[ix, iy], value=c_tile)
 # CHECK:   return output
 
 #Start:
